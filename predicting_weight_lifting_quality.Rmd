@@ -16,7 +16,6 @@ library(gridExtra)
 pml_data <- fread("data/pml-training.csv")
 validate_testing <- fread("data/pml-testing.csv")
 pml_data[,.N, by = "classe"]
-validate_testing[,.N, by = "problem_id"]
 ```
 
 
@@ -59,6 +58,7 @@ ggplot(data = avg_accel,
 ```
 
 Due to abovementioned arguments, both training and validation data sets were transformed by taking summary measures for each of the "real time" observed variables. To ensure that the same transformation would be applied the same way a function were created taking as a single argument the data in which those modifications is intended to be applied. The following summary measures were applied:
+validate_testing[,.N, by = "problem_id"]
 
 * Average
 * Minimum
@@ -81,7 +81,7 @@ euler_angle_vars <- grep("^(pitch|yaw|roll)",names(pml_data),value = T)
 orig_features <- c(euler_angle_vars,movement_vars)
 
 transf_data <- function(data){
-  if(!"classe" %in% names(data)) window_id <- window_id[-1]
+  if(!"classe" %in% names(data)) window_id <- c(window_id[-1],"V1")
   
   # selecting variables
   all_vars <- c(window_id,orig_features)
@@ -167,6 +167,22 @@ training <- pml_data_transf[inTrain,]
 testing <- pml_data_transf[-inTrain,]
 ```
 
+# Feature selection
+
+```{r}
+anova_tests <-
+  lapply(select(training,-one_of(window_id)),
+         function(x){
+           anova(lm(x ~training$classe))$`Pr(>F)`[1]
+         }) %>% 
+  unlist
+selected_features <- 
+  names(anova_tests[anova_tests < 0.05])
+
+nz_vars <- nearZeroVar(select(training,-one_of(window_id)),saveMetrics = T)
+```
+
+
 # Descriptive analysis
 
 The graphs below show some patterns observed for an arbitrary set of variables. 
@@ -192,23 +208,41 @@ b_plot + geom_boxplot(aes(y = amplitude_roll_forearm)) ## esse!
 ```
 
 
-# Training the model
+# Training the models
 
 The predictors were trained using "gbm" and "rf" methods for boosting and random forest, respectively.
 
 ```{r train_models,include = T, eval = params$fit_models}
 ti <- Sys.time()
 set.seed(3676)
-mod_boost <- train(classe~.,method = "gbm",data = training)
-tf1 <- difftime(Sys.time(),ti)
+mod_boost <- train(classe~.,method = "gbm",
+                   data = select(training,classe,
+                                 one_of(selected_features)))
+tf2 <- difftime(Sys.time(),ti)
 
 ti <- Sys.time()
 set.seed(3676)
-mod_rf <- train(classe~.,method = "rf",data = training)
-tf2 <- difftime(Sys.time(),ti)
+mod_rf <- train(classe~.,method = "rf",
+                   data = select(training,classe,
+                                 one_of(selected_features)))
+tf3 <- difftime(Sys.time(),ti)
+
+ti <- Sys.time()
+set.seed(3676)
+mod_lda <- train(classe~.,method = "lda",
+                   data = select(training,classe,
+                                 one_of(selected_features)))
+tf4 <- difftime(Sys.time(),ti)
+
+ti <- Sys.time()
+set.seed(3676)
+mod_nb <- train(classe~.,method = "nb",
+                   data = select(training,classe,
+                                 one_of(selected_features)))
+tf5 <- difftime(Sys.time(),ti)
 
 # saving the models
-save(mod_boost,mod_rf,file = "fitted_models.rda")
+save(mod_boost,mod_rf,mod_lda,mod_nb,file = "fitted_models.rda")
 ```
 
 ```{r load_momdels,include = F,eval = !params$fit_models}
@@ -220,13 +254,21 @@ load(file = "fitted_models.rda")
 
 ```{r confusion_matrix,include = F,results = 'hide'}
 testing[,`:=`(pred_boost = predict(mod_boost,newdata = testing),
-              pred_rf = predict(mod_rf,newdata = testing))]
+              pred_rf = predict(mod_rf,newdata = testing),
+              pred_lda = predict(mod_lda,newdata = testing),
+              pred_nb = predict(mod_nb,newdata = testing))]
 
 tb_boost <-
   testing[,100*prop.table(table(Observed = classe,Predicted = pred_boost),1)]
 
 tb_rf <- 
 testing[,100*prop.table(table(Observed = classe,Predicted = pred_rf),2)]
+
+tb_lda <- 
+testing[,100*prop.table(table(Observed = classe,Predicted = pred_lda),2)]
+
+tb_nb <- 
+testing[,100*prop.table(table(Observed = classe,Predicted = pred_nb),2)]
 
 ```
 
@@ -242,5 +284,26 @@ knitr::kable(tb_rf,
              format.args = list(digits = 2))
 ```
 
+```{r perform_all}
+ti <- Sys.time()
+set.seed(3676)
+mod_boost_final <- train(classe~.,method = "gbm",
+                         data = select(pml_data_transf,
+                                       classe,
+                                       one_of(selected_features)))
+tf2 <- difftime(Sys.time(),ti)
+```
 
-# Predicting in the validation data
+
+```{r validate,include = F,results = 'hide'}
+validate_transf[,`:=`(pred_boost = predict(mod_boost,
+                                           newdata = validate_transf),
+                      pred_boost_final = predict(mod_boost_final,
+                                                 newdata = validate_transf),
+                      pred_rf = predict(mod_rf,
+                                        newdata = validate_transf),
+                      pred_lda = predict(mod_lda,
+                                         newdata = validate_transf))]
+View(validate_transf[,list(V1,pred_boost,pred_boost_final,pred_rf,pred_lda)])
+```
+
