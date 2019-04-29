@@ -1,0 +1,246 @@
+---
+title: "Predicting Weight Lifting Quality"
+author: "Wesley J. Silva"
+date: "28 de abril de 2019"
+output: html_document
+params:
+  fit_models: FALSE
+---
+
+```{r load_data, include = F}
+library(data.table)
+library(dplyr)
+library(caret)
+library(ggplot2)
+library(gridExtra)
+pml_data <- fread("data/pml-training.csv")
+validate_testing <- fread("data/pml-testing.csv")
+pml_data[,.N, by = "classe"]
+validate_testing[,.N, by = "problem_id"]
+```
+
+
+# Introduction
+
+In this exercise, the strategy is to predict the weight lifting quality using summary features measured at the end of a time window.
+
+Some of those summaries were reprocessed, and new ones have been included. For predicting the classes, boosting and random forest approaches were performed. The method with higher accuracy measure was selected to make the predictions in the test data.
+
+# Data transformation
+
+Not all summary measures look as it's described in [the reference paper](http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf). As it's can be seen in the table below, the minimum "*roll belt*" value calculated in the first window don't agree with it's original stated value.
+
+```{r inconsistence,echo = F,results = 'asis'}
+pml_data[raw_timestamp_part_1 == 1323084232,
+         list(min_roll_belt = mean(min_roll_belt,na.rm = T),
+              min_roll_belt_calculated = min(roll_belt,na.rm = T)),
+         by = raw_timestamp_part_1] %>%
+  knitr::kable()
+```
+
+Foremost, it can be shown that the values of "movement variables" (accelerometer, gyrocope and magnetometer) observed at the end of a window can be a potential "good" feature for predicting quality. After taking averages for each "step" by class window, the graph below shows higher differences in the z-dimension accelerometer measures among classes.
+
+```{r final_diff,include = F}
+setorder(pml_data,user_name,classe,raw_timestamp_part_1)
+pml_data[,id_window := 1:.N,by = c("user_name",
+                                   "classe",
+                                   "raw_timestamp_part_1")]
+avg_accel <- 
+  pml_data[,list(accel_arm_z = mean(accel_arm_z),
+                 accel_arm_x = mean(accel_arm_x),
+                 accel_arm_y = mean(accel_arm_y)),
+    by = c("user_name","id_window","classe")] #%>%
+  # select(-user_name) %>%
+  # .[,lapply(.SD,mean), by = c("id_window","classe")]
+ggplot(data = avg_accel,
+       aes(x = id_window,y = accel_arm_x)) + 
+  geom_line(aes(colour = classe),show.legend = T) + 
+  facet_grid(user_name~.)
+```
+
+Due to abovementioned arguments, both training and validation data sets were transformed by taking summary measures for each of the "real time" observed variables. To ensure that the same transformation would be applied the same way a function were created taking as a single argument the data in which those modifications is intended to be applied. The following summary measures were applied:
+
+* Average
+* Minimum
+* Maximum
+* Amplitude
+* first value observed in the window
+* last value observed in the window
+
+```{r transform,include = F,results = 'hide'}
+# window-user id's
+window_id <- c("classe","user_name","raw_timestamp_part_1")
+
+# euler_angle_vars
+euler_angle_vars <- grep("^(pitch|yaw|roll)",names(pml_data),value = T)
+
+# movement vars
+  movement_vars <- grep("(x|y|z)$",names(pml_data),value = T)
+
+# original features
+orig_features <- c(euler_angle_vars,movement_vars)
+
+transf_data <- function(data){
+  if(!"classe" %in% names(data)) window_id <- window_id[-1]
+  
+  # selecting variables
+  all_vars <- c(window_id,orig_features)
+  data <- select(data,one_of(all_vars))
+  
+  # ordering data
+  setorderv(data,cols = window_id)
+
+  # getting averages
+  data_window_ag <-
+    data[,lapply(.SD,mean,na.rm = T),by = c(window_id)] %>%
+    setnames(orig_features,paste0("avg_",orig_features))
+  
+  # # getting standard deviations
+  # data_window_ag <-
+  #   data_window_ag[
+  #     data[,lapply(.SD,sd,na.rm = T),by = c(window_id)],
+  #     on = window_id] %>%
+  #   setnames(orig_features,paste0("sd_",orig_features))
+  
+  # getting min
+  data_window_ag <-
+    data_window_ag[
+      data[,lapply(.SD,min,na.rm = T),by = c(window_id)],
+      on = window_id] %>%
+    setnames(orig_features,paste0("min_",orig_features))
+    
+    # getting max
+    data_window_ag <-
+      data_window_ag[
+        data[,lapply(.SD,max,na.rm = T),by = c(window_id)],
+        on = window_id] %>%
+      setnames(orig_features,paste0("max_",orig_features))
+    
+    # getting amplitude
+    data_window_ag <-
+      data_window_ag[
+        data[,lapply(.SD,function(x){max(x,na.rm = T) - min(x,na.rm = T)}),
+             by = c(window_id)],
+        on = window_id] %>%
+      setnames(orig_features,paste0("amplitude_",orig_features))
+    
+    # getting first observation
+    data_window_ag <-
+      data_window_ag[
+        data[,lapply(.SD,head,n = 1),by = c(window_id)],
+        on = window_id] %>%
+      setnames(orig_features,paste0("first_",orig_features))
+    
+    # getting last observation
+    data_window_ag <-
+      data_window_ag[
+        data[,lapply(.SD,tail,n = 1),by = c(window_id)],
+        on = window_id] %>%
+      setnames(orig_features,paste0("last_",orig_features))
+    
+    
+    data_window_ag
+  
+}
+
+# applying data transformation
+pml_data_transf <- transf_data(pml_data)
+validate_transf <-  transf_data(validate_testing)
+
+# checking NAs
+check_pml_data_na <- unlist(lapply(pml_data_transf,function(x)mean(is.na(x))))
+check_testing_na <- unlist(lapply(validate_transf,function(x)mean(is.na(x))))
+any(check_pml_data_na > 0)
+any(check_testing_na > 0)
+
+```
+
+# Data partition
+
+In order to evaluate the models, considering the validation ("test") data doesn't have the "class" varible, the 'training' data were splited in a training and data sets.
+
+```{r partition,include = T,results = 'hide'}
+#### test X training ----
+set.seed(342)
+inTrain <- createDataPartition(pml_data_transf$classe,p = 0.7, list = F)
+training <- pml_data_transf[inTrain,]
+testing <- pml_data_transf[-inTrain,]
+```
+
+# Descriptive analysis
+
+The graphs below show some patterns observed for an arbitrary set of variables. 
+
+```{r graphs, echo = F,results = 'asis'}
+b_plot <- ggplot(training,aes(col = classe))
+
+cat("\n\n The x-dimension for arm acceleration at the end of the window tends to be lower when the weight lifting is performed the right way.\n\n")
+b_plot + geom_boxplot(aes(y = last_accel_arm_x))
+
+cat("\n\nFurthermore, average belt acceleration in any direction seems to be a good predictor for class E exercises.\n\n")
+b_plot + geom_boxplot(aes(y = amplitude_accel_belt_y)) -> b1
+b_plot + geom_boxplot(aes(y = amplitude_accel_belt_x)) -> b2
+b_plot + geom_boxplot(aes(y = amplitude_accel_belt_z)) -> b3
+grid.arrange(b1,b2,b3,ncol = 1)
+
+cat("\n\n The amplitude of dumbbell's pitch seems to be higher in class B.\n\n")
+b_plot + geom_boxplot(aes(y = amplitude_pitch_dumbbell)) ## esse!
+
+cat("\n\n Finally, the amplitue of forearm's roll tends to be smaller in the classes A and D, despite some outliers in class A.\n\n")
+b_plot + geom_boxplot(aes(y = amplitude_roll_forearm)) ## esse!
+
+```
+
+
+# Training the model
+
+The predictors were trained using "gbm" and "rf" methods for boosting and random forest, respectively.
+
+```{r train_models,include = T, eval = params$fit_models}
+ti <- Sys.time()
+set.seed(3676)
+mod_boost <- train(classe~.,method = "gbm",data = training)
+tf1 <- difftime(Sys.time(),ti)
+
+ti <- Sys.time()
+set.seed(3676)
+mod_rf <- train(classe~.,method = "rf",data = training)
+tf2 <- difftime(Sys.time(),ti)
+
+# saving the models
+save(mod_boost,mod_rf,file = "fitted_models.rda")
+```
+
+```{r load_momdels,include = F,eval = !params$fit_models}
+# loading the models
+load(file = "fitted_models.rda")
+```
+
+# Evaluating on the separate test set
+
+```{r confusion_matrix,include = F,results = 'hide'}
+testing[,`:=`(pred_boost = predict(mod_boost,newdata = testing),
+              pred_rf = predict(mod_rf,newdata = testing))]
+
+tb_boost <-
+  testing[,100*prop.table(table(Observed = classe,Predicted = pred_boost),1)]
+
+tb_rf <- 
+testing[,100*prop.table(table(Observed = classe,Predicted = pred_rf),2)]
+
+```
+
+Using *boosting* algorithm, the estimated accuracy was `r testing[,round(100*mean(pred_boost == classe),1)]`%. On the other hand, random forest showed an accuracy of `r testing[,round(100*mean(pred_rf == classe),1)]`, so boosting were choosen for predicting the classes.
+
+The tables below show the confusion matrix of both classification, with lines representing the actual classes and the predictions coming in the columns. The percentages were calculated for each observed class, giving the sensitivity of each leval.
+
+```{r confusion_matrix_p,echo = F,results = 'asis'}
+knitr::kable(tb_boost,
+             format.args = list(digits = 2))
+
+knitr::kable(tb_rf,
+             format.args = list(digits = 2))
+```
+
+
+# Predicting in the validation data
